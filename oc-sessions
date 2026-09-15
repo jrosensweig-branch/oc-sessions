@@ -6,6 +6,7 @@ import curses
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -860,6 +861,53 @@ def page_jump(rows: list[Row], index: int, usable: int, direction: int) -> int:
     return found if found is not None else index
 
 
+def applescript_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def ensure_directory(directory: str) -> str | None:
+    path = Path(directory)
+    if path.exists():
+        return None
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return f"Could not create {directory}: {error}"
+    return None
+
+
+def launch_session(directory: str, session_id: str) -> str | None:
+    error = ensure_directory(directory)
+    if error:
+        return error
+    if os.environ.get("TERM_PROGRAM") != "iTerm.app":
+        os.execvp("opencode", ["opencode", directory, "-s", session_id])
+        return "failed to exec opencode"
+    command = (
+        f"cd {shlex.quote(directory)} && "
+        f"exec opencode {shlex.quote(directory)} -s {shlex.quote(session_id)}"
+    )
+    script = f"""
+tell application "iTerm"
+  tell current session of current window
+    set rightPane to (split vertically with same profile)
+    tell rightPane
+      write text {applescript_quote(command)}
+    end tell
+  end tell
+end tell
+"""
+    result = subprocess.run(
+        ["osascript", "-"],
+        input=script,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return result.stderr.strip() or "iTerm split failed"
+    return None
+
+
 def first_session_index(rows: list[Row], start: int = 0, step: int = 1) -> int | None:
     if not rows:
         return None
@@ -885,6 +933,7 @@ def picker(
     rows = build_rows(sessions, groups)
     index = first_session_index(rows) or 0
     offset = 0
+    status = ""
 
     while True:
         stdscr.erase()
@@ -915,7 +964,7 @@ def picker(
             y += ITEM_HEIGHT
 
         current = rows[index].session
-        hint = "↑↓ move   enter resume   g group   esc quit"
+        hint = status or "↑↓ move   enter resume   g group   esc quit"
         put(stdscr, height - 1, 0, hint, width, theme["hint"])
         stdscr.refresh()
 
@@ -945,6 +994,8 @@ def picker(
             nxt = first_session_index(rows, len(rows) - 1, -1)
             if nxt is not None:
                 index = nxt
+        elif key == curses.KEY_RESIZE:
+            continue
         elif key == ord("g") and current is not None:
             updated = group_choice(stdscr, current, groups, theme)
             if updated is not None:
@@ -959,8 +1010,10 @@ def picker(
                 )
         elif key in (curses.KEY_ENTER, 10, 13) and current is not None:
             directory = resume_choice(stdscr, current, theme)
-            if directory:
-                return current, directory
+            if not directory:
+                continue
+            error = launch_session(directory, current.id)
+            status = error or f"Opened in right pane: {current.title}"
 
 
 def main() -> int:
@@ -968,6 +1021,7 @@ def main() -> int:
         print("oc-sessions — pick an OpenCode session from any directory")
         print("Arrow keys / j k to move, enter to resume, g to group, esc to quit.")
         print("After enter: resume in the original directory, or resume here.")
+        print("In iTerm, resume splits a pane to the right and leaves the picker open.")
         print("If the original directory is gone, it will be created.")
         print("Groups are local to oc-sessions, not OpenCode pins.")
         print("Theme follows OpenCode (/themes or tui.json).")
@@ -988,19 +1042,8 @@ def main() -> int:
     mode = active_mode()
     palette = resolved_palette(load_theme_json(name), mode)
     groups = load_groups()
-    picked = curses.wrapper(picker, sessions, groups, palette)
-    if picked is None:
-        return 0
-    selected, directory = picked
-    path = Path(directory)
-    if not path.exists():
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            print(f"Could not create {directory}: {error}", file=sys.stderr)
-            return 1
-    os.execvp("opencode", ["opencode", directory, "-s", selected.id])
-    return 1
+    curses.wrapper(picker, sessions, groups, palette)
+    return 0
 
 
 if __name__ == "__main__":
