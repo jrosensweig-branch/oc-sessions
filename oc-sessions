@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+SQL = """
+SELECT
+  s.id,
+  s.title,
+  s.directory,
+  s.slug,
+  s.agent,
+  s.model,
+  s.time_updated
+FROM session s
+WHERE s.parent_id IS NULL
+  AND s.time_archived IS NULL
+ORDER BY s.time_updated DESC
+"""
+
+HOME = Path.home()
+HERE = Path.cwd()
+ITEM_HEIGHT = 2
+MISSING_TAG = "[DIRECTORY MISSING]"
+THEME_URL = (
+    "https://raw.githubusercontent.com/anomalyco/opencode/dev/"
+    "packages/tui/src/theme/assets/{name}.json"
+)
+ANSI = [
+    "#000000",
+    "#800000",
+    "#008000",
+    "#808000",
+    "#000080",
+    "#800080",
+    "#008080",
+    "#c0c0c0",
+    "#808080",
+    "#ff0000",
+    "#00ff00",
+    "#ffff00",
+    "#0000ff",
+    "#ff00ff",
+    "#00ffff",
+    "#ffffff",
+]
+FALLBACK_THEME = {
+    "defs": {
+        "darkStep9": "#fab283",
+        "darkStep11": "#808080",
+        "darkStep12": "#eeeeee",
+        "darkRed": "#e06c75",
+        "darkStep1": "#0a0a0a",
+        "darkStep4": "#282828",
+    },
+    "theme": {
+        "primary": {"dark": "darkStep9", "light": "#3b7dd8"},
+        "error": {"dark": "darkRed", "light": "#d1383d"},
+        "text": {"dark": "darkStep12", "light": "#1a1a1a"},
+        "textMuted": {"dark": "darkStep11", "light": "#8a8a8a"},
+        "background": {"dark": "darkStep1", "light": "#ffffff"},
+        "backgroundElement": {"dark": "darkStep4", "light": "#f5f5f5"},
+        "selectedListItemText": {"dark": "darkStep1", "light": "#ffffff"},
+    },
+}
+
+
+@dataclass
+class Session:
+    id: str
+    title: str
+    directory: str
+    slug: str
+    agent: str
+    model: str
+    time_updated: int
+
+    @property
+    def missing(self) -> bool:
+        return not Path(self.directory).is_dir()
+
+    @property
+    def path_label(self) -> str:
+        return display_path(self.directory)
+
+    @property
+    def model_label(self) -> str:
+        if not self.model:
+            return ""
+        try:
+            data = json.loads(self.model)
+        except json.JSONDecodeError:
+            return self.model
+        return data.get("id") or ""
+
+    @property
+    def age_label(self) -> str:
+        seconds = max(0, int(time.time() - self.time_updated / 1000))
+        if seconds < 60:
+            return "just now"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        days = hours // 24
+        if days < 14:
+            return f"{days}d ago"
+        return time.strftime("%Y-%m-%d", time.localtime(self.time_updated / 1000))
+
+    @property
+    def meta(self) -> str:
+        parts = [self.path_label, self.age_label]
+        if self.agent:
+            parts.append(self.agent)
+        if self.model_label:
+            parts.append(self.model_label)
+        return "  ·  ".join(parts)
+
+
+@dataclass
+class Row:
+    kind: str
+    label: str
+    session: Session | None = None
+
+
+def display_path(path: str | Path) -> str:
+    text = str(path)
+    home = str(HOME)
+    if text.startswith(home):
+        return "~" + text[len(home) :]
+    return text
+
+
+def xdg_path(env: str, fallback: Path) -> Path:
+    value = os.environ.get(env)
+    return Path(value) if value else fallback
+
+
+def config_dirs() -> list[Path]:
+    dirs = [xdg_path("XDG_CONFIG_HOME", HOME / ".config") / "opencode"]
+    current = Path.cwd().resolve()
+    while True:
+        dirs.append(current / ".opencode")
+        if current.parent == current:
+            break
+        current = current.parent
+    return dirs
+
+
+def state_dir() -> Path:
+    return xdg_path("XDG_STATE_HOME", HOME / ".local/state") / "opencode"
+
+
+def cache_dir() -> Path:
+    return xdg_path("XDG_CACHE_HOME", HOME / ".cache") / "oc-sessions" / "themes"
+
+
+def groups_path() -> Path:
+    return xdg_path("XDG_STATE_HOME", HOME / ".local/state") / "oc-sessions" / "groups.json"
+
+
+def load_groups() -> dict:
+    path = groups_path()
+    if not path.exists():
+        return {"order": [], "sessions": {}}
+    try:
+        data = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {"order": [], "sessions": {}}
+    if not isinstance(data, dict):
+        return {"order": [], "sessions": {}}
+    order = [name for name in data.get("order", []) if isinstance(name, str) and name.strip()]
+    sessions = {
+        key: value
+        for key, value in (data.get("sessions") or {}).items()
+        if isinstance(key, str) and isinstance(value, str) and value.strip()
+    }
+    for name in sessions.values():
+        if name not in order:
+            order.append(name)
+    return {"order": order, "sessions": sessions}
+
+
+def save_groups(groups: dict) -> None:
+    path = groups_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(groups, indent=2) + "\n")
+
+
+def assign_group(groups: dict, session_id: str, name: str | None) -> dict:
+    sessions = dict(groups.get("sessions") or {})
+    order = list(groups.get("order") or [])
+    if not name:
+        sessions.pop(session_id, None)
+        return {"order": order, "sessions": sessions}
+    name = name.strip()
+    if not name:
+        sessions.pop(session_id, None)
+        return {"order": order, "sessions": sessions}
+    sessions[session_id] = name
+    if name not in order:
+        order.append(name)
+    return {"order": order, "sessions": sessions}
+
+
+def build_rows(sessions: list[Session], groups: dict) -> list[Row]:
+    mapping = groups.get("sessions") or {}
+    order = groups.get("order") or []
+    by_group: dict[str, list[Session]] = {}
+    ungrouped: list[Session] = []
+    for session in sessions:
+        name = mapping.get(session.id)
+        if name:
+            by_group.setdefault(name, []).append(session)
+        else:
+            ungrouped.append(session)
+
+    rows: list[Row] = []
+    seen: set[str] = set()
+    for name in order:
+        items = by_group.get(name)
+        if not items:
+            continue
+        seen.add(name)
+        rows.append(Row("header", name))
+        rows.extend(Row("session", name, session) for session in items)
+    for name, items in by_group.items():
+        if name in seen:
+            continue
+        rows.append(Row("header", name))
+        rows.extend(Row("session", name, session) for session in items)
+    if ungrouped:
+        rows.append(Row("header", "Ungrouped"))
+        rows.extend(Row("session", "Ungrouped", session) for session in ungrouped)
+    return rows
+
+
+def read_json(path: Path) -> object:
+    text = path.read_text()
+    if path.suffix == ".jsonc":
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        text = re.sub(r"//.*?$", "", text, flags=re.M)
+    return json.loads(text)
+
+
+def load_kv() -> dict:
+    path = state_dir() / "kv.json"
+    if not path.exists():
+        return {}
+    try:
+        data = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_tui_config() -> dict:
+    for directory in config_dirs()[:1]:
+        for name in ("tui.json", "tui.jsonc"):
+            path = directory / name
+            if not path.exists():
+                continue
+            try:
+                data = read_json(path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                return data
+    env = os.environ.get("OPENCODE_TUI_CONFIG")
+    if env:
+        path = Path(env)
+        if path.exists():
+            try:
+                data = read_json(path)
+                if isinstance(data, dict):
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass
+    return {}
+
+
+def active_theme_name() -> str:
+    config = load_tui_config()
+    theme = config.get("theme")
+    if isinstance(theme, str) and theme:
+        return theme
+    kv = load_kv()
+    theme = kv.get("theme")
+    if isinstance(theme, str) and theme:
+        return theme
+    return "opencode"
+
+
+def active_mode() -> str:
+    kv = load_kv()
+    lock = kv.get("theme_mode_lock")
+    if lock in ("dark", "light"):
+        return lock
+    return "dark"
+
+
+def find_theme_file(name: str) -> Path | None:
+    for directory in config_dirs():
+        path = directory / "themes" / f"{name}.json"
+        if path.exists():
+            return path
+    cached = cache_dir() / f"{name}.json"
+    if cached.exists():
+        return cached
+    return None
+
+
+def fetch_builtin_theme(name: str) -> dict | None:
+    cached = cache_dir() / f"{name}.json"
+    try:
+        with urllib.request.urlopen(THEME_URL.format(name=name), timeout=4) as response:
+            payload = response.read()
+        cache_dir().mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(payload)
+        return json.loads(payload)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        if cached.exists():
+            try:
+                data = read_json(cached)
+                if isinstance(data, dict):
+                    return data
+            except (OSError, json.JSONDecodeError):
+                return None
+        return None
+
+
+def load_theme_json(name: str) -> dict:
+    if name == "system":
+        return FALLBACK_THEME
+    path = find_theme_file(name)
+    if path is not None:
+        try:
+            data = read_json(path)
+            if isinstance(data, dict) and "theme" in data:
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    fetched = fetch_builtin_theme(name)
+    if isinstance(fetched, dict) and "theme" in fetched:
+        return fetched
+    if name != "opencode":
+        fetched = fetch_builtin_theme("opencode")
+        if isinstance(fetched, dict) and "theme" in fetched:
+            return fetched
+    return FALLBACK_THEME
+
+
+def parse_hex(value: str) -> tuple[int, int, int] | None:
+    value = value.lstrip("#")
+    if len(value) == 8:
+        value = value[:6]
+    if len(value) == 3:
+        value = "".join(ch * 2 for ch in value)
+    if len(value) != 6:
+        return None
+    try:
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    except ValueError:
+        return None
+
+
+def ansi_to_rgb(code: int) -> tuple[int, int, int]:
+    if 0 <= code < 16:
+        return parse_hex(ANSI[code]) or (0, 0, 0)
+    if code < 232:
+        index = code - 16
+        blue = index % 6
+        green = (index // 6) % 6
+        red = index // 36
+
+        def val(part: int) -> int:
+            return 0 if part == 0 else part * 40 + 55
+
+        return val(red), val(green), val(blue)
+    if code < 256:
+        gray = (code - 232) * 10 + 8
+        return gray, gray, gray
+    return 0, 0, 0
+
+
+def resolve_color(theme: dict, value: object, mode: str, chain: tuple[str, ...] = ()) -> tuple[int, int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return ansi_to_rgb(int(value))
+    if isinstance(value, dict):
+        next_value = value.get(mode, value.get("dark"))
+        return resolve_color(theme, next_value, mode, chain)
+    if not isinstance(value, str):
+        return None
+    if value in ("none", "transparent"):
+        return None
+    if value.startswith("#"):
+        return parse_hex(value)
+    if value in chain:
+        return None
+    defs = theme.get("defs") if isinstance(theme.get("defs"), dict) else {}
+    colors = theme.get("theme") if isinstance(theme.get("theme"), dict) else {}
+    nxt = defs.get(value, colors.get(value))
+    return resolve_color(theme, nxt, mode, chain + (value,))
+
+
+def contrast_text(bg: tuple[int, int, int]) -> tuple[int, int, int]:
+    luminance = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+    return (10, 10, 10) if luminance > 140 else (238, 238, 238)
+
+
+def resolved_palette(theme: dict, mode: str) -> dict[str, tuple[int, int, int] | None]:
+    colors = theme.get("theme") if isinstance(theme.get("theme"), dict) else {}
+    primary = resolve_color(theme, colors.get("primary"), mode) or parse_hex("#fab283")
+    error = parse_hex("#ff2a2a")
+    text = resolve_color(theme, colors.get("text"), mode) or parse_hex("#eeeeee")
+    muted = resolve_color(theme, colors.get("textMuted"), mode) or parse_hex("#808080")
+    background = resolve_color(theme, colors.get("background"), mode)
+    selected_fg = resolve_color(theme, colors.get("selectedListItemText"), mode)
+    selected_bg = primary
+    if selected_fg is None:
+        selected_fg = background or contrast_text(selected_bg)
+    return {
+        "primary": primary,
+        "error": error,
+        "text": text,
+        "muted": muted,
+        "selected_bg": selected_bg,
+        "selected_fg": selected_fg,
+    }
+
+
+def load_sessions() -> list[Session]:
+    result = subprocess.run(
+        ["opencode", "db", "--format", "json", SQL],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "opencode db failed"
+        raise SystemExit(message)
+    rows = json.loads(result.stdout)
+    return [
+        Session(
+            id=row["id"],
+            title=row["title"] or row["slug"] or row["id"],
+            directory=row["directory"],
+            slug=row["slug"] or "",
+            agent=row["agent"] or "",
+            model=row["model"] or "",
+            time_updated=int(row["time_updated"]),
+        )
+        for row in rows
+    ]
+
+
+def rgb_to_256(r: int, g: int, b: int) -> int:
+    gray = abs(r - g) < 10 and abs(g - b) < 10 and abs(r - b) < 10
+    if gray:
+        avg = (r + g + b) // 3
+        if avg < 8:
+            return 16
+        if avg > 238:
+            return 231
+        return 232 + min(23, max(0, (avg - 8) * 24 // 247))
+
+    def snap(value: int) -> int:
+        if value < 75:
+            return 0
+        return min(5, (value - 35) // 40)
+
+    return 16 + 36 * snap(r) + 6 * snap(g) + snap(b)
+
+
+def clip(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[: width - 1] + "…"
+
+
+def put(stdscr, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
+    height, cols = stdscr.getmaxyx()
+    if y < 0 or y >= height or x >= cols or width <= 0:
+        return
+    stdscr.addnstr(y, x, clip(text, width), width, attr)
+
+
+def fill_row(stdscr, y: int, width: int, attr: int) -> None:
+    put(stdscr, y, 0, " " * width, width, attr)
+
+
+def setup_theme(stdscr, palette: dict[str, tuple[int, int, int] | None]):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    fallback = {
+        "header": curses.A_BOLD,
+        "title": curses.A_BOLD,
+        "meta": curses.A_DIM,
+        "missing": curses.A_BOLD,
+        "selected_title": curses.A_REVERSE | curses.A_BOLD,
+        "selected_meta": curses.A_REVERSE,
+        "selected_missing": curses.A_REVERSE | curses.A_BOLD,
+        "count": curses.A_DIM,
+        "hint": curses.A_DIM,
+        "bar": curses.A_BOLD,
+    }
+    if not curses.has_colors():
+        return fallback
+
+    curses.start_color()
+    if curses.COLORS < 256:
+        curses.init_pair(1, curses.COLOR_YELLOW, -1)
+        curses.init_pair(2, curses.COLOR_WHITE, -1)
+        curses.init_pair(3, curses.COLOR_WHITE, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_YELLOW)
+        curses.init_pair(8, curses.COLOR_YELLOW, -1)
+        return {
+            "header": curses.color_pair(1) | curses.A_BOLD,
+            "title": curses.color_pair(2) | curses.A_BOLD,
+            "meta": curses.color_pair(3) | curses.A_DIM,
+            "missing": curses.color_pair(4) | curses.A_BOLD,
+            "selected_title": curses.color_pair(5) | curses.A_BOLD,
+            "selected_meta": curses.color_pair(6),
+            "selected_missing": curses.color_pair(7) | curses.A_BOLD,
+            "count": curses.color_pair(3) | curses.A_DIM,
+            "hint": curses.color_pair(3) | curses.A_DIM,
+            "bar": curses.color_pair(8) | curses.A_BOLD,
+        }
+
+    def color(key: str, default: tuple[int, int, int]) -> int:
+        rgb = palette.get(key) or default
+        return rgb_to_256(*rgb)
+
+    primary = color("primary", (250, 178, 131))
+    error = color("error", (255, 42, 42))
+    text = color("text", (238, 238, 238))
+    muted = color("muted", (128, 128, 128))
+    selected_bg = color("selected_bg", (250, 178, 131))
+    selected_fg = color("selected_fg", (10, 10, 10))
+    curses.init_pair(1, primary, -1)
+    curses.init_pair(2, text, -1)
+    curses.init_pair(3, muted, -1)
+    curses.init_pair(4, error, -1)
+    curses.init_pair(5, selected_fg, selected_bg)
+    curses.init_pair(6, selected_fg, selected_bg)
+    curses.init_pair(7, text, selected_bg)
+    curses.init_pair(8, primary, -1)
+    return {
+        "header": curses.color_pair(1) | curses.A_BOLD,
+        "title": curses.color_pair(2) | curses.A_BOLD,
+        "meta": curses.color_pair(3),
+        "missing": curses.color_pair(4) | curses.A_BOLD,
+        "selected_title": curses.color_pair(5) | curses.A_BOLD,
+        "selected_meta": curses.color_pair(6),
+        "selected_missing": curses.color_pair(7) | curses.A_BOLD,
+        "count": curses.color_pair(3),
+        "hint": curses.color_pair(3),
+        "bar": curses.color_pair(8) | curses.A_BOLD,
+    }
+
+
+def draw_title(stdscr, y: int, session: Session, width: int, theme: dict, selected: bool) -> None:
+    if selected:
+        fill_row(stdscr, y, width, theme["selected_title"])
+        bar_attr = theme["bar"]
+        title_attr = theme["selected_missing"] if session.missing else theme["selected_title"]
+        marker = "▌"
+    else:
+        bar_attr = 0
+        title_attr = theme["missing"] if session.missing else theme["title"]
+        marker = " "
+    put(stdscr, y, 0, marker, 1, bar_attr)
+
+    inner = max(0, width - 2)
+    title = session.title
+    if session.missing:
+        tag = f" {MISSING_TAG}"
+        room = max(0, inner - len(tag))
+        put(stdscr, y, 1, clip(title, room), room, title_attr)
+        if inner > 0:
+            put(stdscr, y, 1 + min(len(title), room), tag, inner - min(len(title), room), title_attr)
+        return
+    put(stdscr, y, 1, f" {title}", inner, title_attr)
+
+
+def prompt_text(stdscr, theme: dict, title: str, prompt: str) -> str | None:
+    value = ""
+    while True:
+        height, width = stdscr.getmaxyx()
+        box_height = 6
+        box_width = min(width - 4, max(48, min(72, width - 8)))
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+        inner = max(0, box_width - 4)
+        for row in range(box_height):
+            put(stdscr, top + row, left, " " * box_width, box_width, theme["title"])
+        put(stdscr, top + 1, left + 2, clip(title, inner), inner, theme["header"])
+        put(stdscr, top + 2, left + 2, clip(prompt, inner), inner, theme["meta"])
+        field = value + "█"
+        put(stdscr, top + 4, left + 2, clip(field, inner), inner, theme["selected_title"])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27,):
+            return None
+        if key in (curses.KEY_ENTER, 10, 13):
+            return value.strip() or None
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            value = value[:-1]
+            continue
+        if key == curses.KEY_RESIZE:
+            continue
+        if 32 <= key <= 126:
+            value += chr(key)
+
+
+def group_choice(stdscr, session: Session, groups: dict, theme: dict) -> dict | None:
+    names = list(groups.get("order") or [])
+    current = (groups.get("sessions") or {}).get(session.id)
+    options = [("new", "New group…")]
+    if current:
+        options.append(("ungroup", "Ungroup"))
+    for name in names:
+        mark = "  [current]" if name == current else ""
+        options.append((name, name + mark))
+    options.append(("cancel", "Cancel"))
+    index = 0
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        box_height = min(height - 2, max(8, len(options) + 5))
+        box_width = min(width - 4, max(48, min(72, width - 8)))
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+        inner = max(0, box_width - 4)
+        for row in range(box_height):
+            put(stdscr, top + row, left, " " * box_width, box_width, theme["title"])
+        put(stdscr, top + 1, left + 2, clip(session.title, inner), inner, theme["header"])
+        put(stdscr, top + 2, left + 2, clip("Move this session to a group.", inner), inner, theme["meta"])
+        visible = max(1, box_height - 5)
+        start = 0
+        if index >= visible:
+            start = index - visible + 1
+        for row, (key, label) in enumerate(options[start : start + visible]):
+            y = top + 4 + row
+            selected = start + row == index
+            if selected:
+                put(stdscr, y, left, " " * box_width, box_width, theme["selected_title"])
+                attr = theme["selected_title"]
+                marker = "▌"
+            else:
+                attr = theme["title"]
+                marker = " "
+            put(stdscr, y, left, marker, 1, theme["bar"] if selected else 0)
+            put(stdscr, y, left + 2, clip(label, inner), inner, attr)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27, ord("q")):
+            return None
+        if key in (curses.KEY_UP, ord("k")):
+            index = (index - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            index = (index + 1) % len(options)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            choice, _label = options[index]
+            if choice == "cancel":
+                return None
+            if choice == "ungroup":
+                return assign_group(groups, session.id, None)
+            if choice == "new":
+                name = prompt_text(stdscr, theme, "New group", "Name")
+                if not name:
+                    continue
+                return assign_group(groups, session.id, name)
+            return assign_group(groups, session.id, choice)
+
+
+def drain_keys(stdscr) -> None:
+    stdscr.nodelay(True)
+    try:
+        while stdscr.getch() != curses.ERR:
+            pass
+    finally:
+        stdscr.nodelay(False)
+
+
+def confirm_quit(stdscr, theme: dict) -> bool:
+    options = ["Yes", "No"]
+    index = 0
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        box_height = 6
+        box_width = min(width - 4, 42)
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+        inner = max(0, box_width - 4)
+
+        for row in range(box_height):
+            put(stdscr, top + row, left, " " * box_width, box_width, theme["title"])
+
+        put(stdscr, top + 1, left + 2, clip("Close oc-sessions?", inner), inner, theme["header"])
+        put(stdscr, top + 2, left + 2, clip("Unsaved picker state is discarded.", inner), inner, theme["meta"])
+
+        labels = []
+        for row, label in enumerate(options):
+            if row == index:
+                labels.append(f"▌ {label} ")
+            else:
+                labels.append(f"  {label} ")
+        buttons = "   ".join(labels)
+        start = left + max(2, (box_width - len(buttons)) // 2)
+        x = start
+        for row, label in enumerate(options):
+            text = labels[row]
+            attr = theme["selected_title"] if row == index else theme["title"]
+            put(stdscr, top + 4, x, text, len(text), attr)
+            x += len(text) + 3
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_LEFT, curses.KEY_UP, ord("h"), ord("k")):
+            index = 0
+        elif key in (curses.KEY_RIGHT, curses.KEY_DOWN, ord("l"), ord("j")):
+            index = 1
+        elif key in (ord("y"), ord("Y")):
+            return True
+        elif key in (ord("n"), ord("N"), 27):
+            return False
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return index == 0
+
+
+def resume_choice(stdscr, session: Session, theme: dict) -> str | None:
+    original = session.directory
+    here = str(HERE)
+    options = [
+        ("original", f"Resume in original  {display_path(original)}", True),
+        ("here", f"Resume here         {display_path(here)}", True),
+        ("cancel", "Cancel", True),
+    ]
+    index = 0
+
+    while True:
+        height, width = stdscr.getmaxyx()
+        box_height = 8
+        box_width = min(width - 4, max(48, min(72, width - 8)))
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+        inner = max(0, box_width - 4)
+
+        for row in range(box_height):
+            put(stdscr, top + row, left, " " * box_width, box_width, theme["title"])
+
+        put(stdscr, top + 1, left + 2, clip(session.title, inner), inner, theme["header"])
+        prompt = (
+            "Original directory is gone. Resume will recreate it."
+            if session.missing
+            else "Where should this session resume?"
+        )
+        put(stdscr, top + 2, left + 2, clip(prompt, inner), inner, theme["meta"])
+
+        for row, (_key, label, enabled) in enumerate(options):
+            y = top + 4 + row
+            selected = row == index
+            if selected:
+                fill_row_segment = " " * box_width
+                put(stdscr, y, left, fill_row_segment, box_width, theme["selected_title"])
+                attr = theme["selected_title"]
+                marker = "▌"
+            else:
+                attr = theme["title"] if enabled else theme["meta"]
+                marker = " "
+            put(stdscr, y, left, marker, 1, theme["bar"] if selected else 0)
+            suffix = "  [will create]" if _key == "original" and session.missing else ""
+            put(stdscr, y, left + 2, clip(label + suffix, inner), inner, attr)
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return None
+        if key in (curses.KEY_UP, ord("k")):
+            index = (index - 1) % len(options)
+            while not options[index][2]:
+                index = (index - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            index = (index + 1) % len(options)
+            while not options[index][2]:
+                index = (index + 1) % len(options)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            choice, _label, enabled = options[index]
+            if not enabled:
+                continue
+            if choice == "cancel":
+                return None
+            if choice == "here":
+                return here
+            return original
+
+
+def row_height(row: Row) -> int:
+    return 1 if row.kind == "header" else ITEM_HEIGHT
+
+
+def ensure_visible(rows: list[Row], index: int, offset: int, usable: int) -> int:
+    if not rows:
+        return 0
+    index = max(0, min(index, len(rows) - 1))
+    if index < offset:
+        return index
+    used = sum(row_height(row) for row in rows[offset : index + 1])
+    if used <= usable:
+        return offset
+    remaining = usable - row_height(rows[index])
+    new_offset = index
+    while new_offset > 0:
+        previous = row_height(rows[new_offset - 1])
+        if remaining < previous:
+            break
+        remaining -= previous
+        new_offset -= 1
+    return new_offset
+
+
+def page_jump(rows: list[Row], index: int, usable: int, direction: int) -> int:
+    if not rows:
+        return 0
+    remaining = usable
+    nxt = index
+    while 0 <= nxt + direction < len(rows):
+        nxt += direction
+        remaining -= row_height(rows[nxt])
+        if remaining <= 0:
+            break
+    found = first_session_index(rows, nxt, direction)
+    if found is not None:
+        return found
+    found = first_session_index(rows, nxt, -direction)
+    return found if found is not None else index
+
+
+def first_session_index(rows: list[Row], start: int = 0, step: int = 1) -> int | None:
+    if not rows:
+        return None
+    index = start
+    while 0 <= index < len(rows):
+        if rows[index].kind == "session":
+            return index
+        index += step
+    return None
+
+
+def picker(
+    stdscr,
+    sessions: list[Session],
+    groups: dict,
+    palette: dict[str, tuple[int, int, int] | None],
+) -> tuple[Session, str] | None:
+    try:
+        curses.set_escdelay(25)
+    except Exception:
+        os.environ.setdefault("ESCDELAY", "25")
+    theme = setup_theme(stdscr, palette)
+    rows = build_rows(sessions, groups)
+    index = first_session_index(rows) or 0
+    offset = 0
+
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        header_rows = 2
+        footer_rows = 1
+        usable = max(1, height - header_rows - footer_rows)
+        offset = ensure_visible(rows, index, offset, usable)
+
+        put(stdscr, 0, 0, "OpenCode sessions", width - 12, theme["header"])
+        put(stdscr, 0, max(0, width - 11), f"{len(sessions):>4} total", 11, theme["count"])
+
+        y = header_rows
+        for i, row in enumerate(rows[offset:], start=offset):
+            needed = row_height(row)
+            if y + needed > height - footer_rows:
+                break
+            selected = i == index
+            if row.kind == "header":
+                put(stdscr, y, 0, clip(row.label.upper(), width), width, theme["header"])
+                y += 1
+                continue
+            session = row.session
+            if session is None:
+                continue
+            draw_title(stdscr, y, session, width, theme, selected)
+            put(stdscr, y + 1, 1, f" {session.meta}", max(0, width - 1), theme["meta"])
+            y += ITEM_HEIGHT
+
+        current = rows[index].session
+        hint = "↑↓ move   enter resume   g group   esc quit"
+        put(stdscr, height - 1, 0, hint, width, theme["hint"])
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            drain_keys(stdscr)
+            if confirm_quit(stdscr, theme):
+                return None
+            continue
+        if key in (curses.KEY_UP, ord("k")):
+            nxt = first_session_index(rows, index - 1, -1)
+            if nxt is not None:
+                index = nxt
+        elif key in (curses.KEY_DOWN, ord("j")):
+            nxt = first_session_index(rows, index + 1, 1)
+            if nxt is not None:
+                index = nxt
+        elif key == curses.KEY_PPAGE:
+            index = page_jump(rows, index, usable, -1)
+        elif key == curses.KEY_NPAGE:
+            index = page_jump(rows, index, usable, 1)
+        elif key == curses.KEY_HOME:
+            nxt = first_session_index(rows)
+            if nxt is not None:
+                index = nxt
+        elif key == curses.KEY_END:
+            nxt = first_session_index(rows, len(rows) - 1, -1)
+            if nxt is not None:
+                index = nxt
+        elif key == ord("g") and current is not None:
+            updated = group_choice(stdscr, current, groups, theme)
+            if updated is not None:
+                groups.clear()
+                groups.update(updated)
+                save_groups(groups)
+                session_id = current.id
+                rows = build_rows(sessions, groups)
+                index = next(
+                    (i for i, row in enumerate(rows) if row.session and row.session.id == session_id),
+                    first_session_index(rows) or 0,
+                )
+        elif key in (curses.KEY_ENTER, 10, 13) and current is not None:
+            directory = resume_choice(stdscr, current, theme)
+            if directory:
+                return current, directory
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print("oc-sessions — pick an OpenCode session from any directory")
+        print("Arrow keys / j k to move, enter to resume, g to group, esc to quit.")
+        print("After enter: resume in the original directory, or resume here.")
+        print("If the original directory is gone, it will be created.")
+        print("Groups are local to oc-sessions, not OpenCode pins.")
+        print("Theme follows OpenCode (/themes or tui.json).")
+        return 0
+
+    sessions = load_sessions()
+    if not sessions:
+        print("No OpenCode sessions found.")
+        return 1
+
+    if not sys.stdout.isatty():
+        for session in sessions:
+            tag = f" {MISSING_TAG}" if session.missing else ""
+            print(f"{session.id}\t{session.title}{tag}\t{session.directory}")
+        return 0
+
+    name = active_theme_name()
+    mode = active_mode()
+    palette = resolved_palette(load_theme_json(name), mode)
+    groups = load_groups()
+    picked = curses.wrapper(picker, sessions, groups, palette)
+    if picked is None:
+        return 0
+    selected, directory = picked
+    path = Path(directory)
+    if not path.exists():
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            print(f"Could not create {directory}: {error}", file=sys.stderr)
+            return 1
+    os.execvp("opencode", ["opencode", directory, "-s", selected.id])
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
