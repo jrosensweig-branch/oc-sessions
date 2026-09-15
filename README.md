@@ -33,6 +33,8 @@ oc-sessions
 - `PgUp` / `PgDn` — page
 - `Home` / `End` — jump to first / last session
 
+In iTerm, resume splits a pane to the right and leaves the picker open on the left. Outside iTerm, resume replaces the picker as before.
+
 If a session’s original directory is gone, resuming there recreates it.
 
 ## Theme
