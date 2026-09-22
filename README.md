@@ -29,6 +29,12 @@ oc-sessions
 - `↑` `↓` / `j` `k` — move
 - `Enter` — resume (original directory or current directory)
 - `g` — assign the session to a group
+- `r` — rename the session in OpenCode
+- `d` — hide the session from this picker
+- `h` — view hidden sessions
+- `b` — back to the main list
+- `u` — unhide the selected hidden session
+- `x` — delete the session from OpenCode (asks first)
 - `Esc` — quit
 - `PgUp` / `PgDn` — page
 - `Home` / `End` — jump to first / last session
@@ -43,10 +49,11 @@ The picker follows your OpenCode theme (`/themes` or `tui.json`). Theme files ar
 
 ## Groups
 
-Groups are local to `oc-sessions`, not OpenCode pins. They are stored at:
+Groups and hidden sessions are local to `oc-sessions`, not OpenCode pins. They are stored at:
 
 ```
 ~/.local/state/oc-sessions/groups.json
+~/.local/state/oc-sessions/hidden.json
 ```
 
-That file is per-user and is not part of this repo.
+Those files are per-user and are not part of this repo. Hide only removes a session from this picker. Press `h` to view hidden sessions, `u` to restore one, and `b` to go back. Delete calls `opencode session delete` and is permanent.

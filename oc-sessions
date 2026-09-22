@@ -174,6 +174,14 @@ def groups_path() -> Path:
     return xdg_path("XDG_STATE_HOME", HOME / ".local/state") / "oc-sessions" / "groups.json"
 
 
+def hidden_path() -> Path:
+    return xdg_path("XDG_STATE_HOME", HOME / ".local/state") / "oc-sessions" / "hidden.json"
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def load_groups() -> dict:
     path = groups_path()
     if not path.exists():
@@ -200,6 +208,50 @@ def save_groups(groups: dict) -> None:
     path = groups_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(groups, indent=2) + "\n")
+
+
+def load_hidden() -> set[str]:
+    path = hidden_path()
+    if not path.exists():
+        return set()
+    try:
+        data = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {item for item in data if isinstance(item, str) and item.strip()}
+
+
+def save_hidden(hidden: set[str]) -> None:
+    path = hidden_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(hidden), indent=2) + "\n")
+
+
+def rename_session(session_id: str, title: str) -> str | None:
+    query = f"UPDATE session SET title = {sql_literal(title)} WHERE id = {sql_literal(session_id)}"
+    result = subprocess.run(
+        ["opencode", "db", "--format", "json", query],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return result.stderr.strip() or result.stdout.strip() or "rename failed"
+    return None
+
+
+def delete_session(session: Session) -> str | None:
+    cwd = session.directory if Path(session.directory).is_dir() else None
+    result = subprocess.run(
+        ["opencode", "session", "delete", session.id],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    if result.returncode != 0:
+        return result.stderr.strip() or result.stdout.strip() or "delete failed"
+    return None
 
 
 def assign_group(groups: dict, session_id: str, name: str | None) -> dict:
@@ -606,8 +658,8 @@ def draw_title(stdscr, y: int, session: Session, width: int, theme: dict, select
     put(stdscr, y, 1, f" {title}", inner, title_attr)
 
 
-def prompt_text(stdscr, theme: dict, title: str, prompt: str) -> str | None:
-    value = ""
+def prompt_text(stdscr, theme: dict, title: str, prompt: str, initial: str = "") -> str | None:
+    value = initial
     while True:
         height, width = stdscr.getmaxyx()
         box_height = 6
@@ -697,23 +749,22 @@ def group_choice(stdscr, session: Session, groups: dict, theme: dict) -> dict | 
             return assign_group(groups, session.id, choice)
 
 
-def drain_keys(stdscr) -> None:
-    stdscr.nodelay(True)
-    try:
-        while stdscr.getch() != curses.ERR:
-            pass
-    finally:
-        stdscr.nodelay(False)
-
-
-def confirm_quit(stdscr, theme: dict) -> bool:
-    options = ["Yes", "No"]
-    index = 0
+def confirm_choice(
+    stdscr,
+    theme: dict,
+    title: str,
+    prompt: str,
+    yes_label: str = "Yes",
+    no_label: str = "No",
+    default_yes: bool = False,
+) -> bool:
+    options = [yes_label, no_label]
+    index = 0 if default_yes else 1
 
     while True:
         height, width = stdscr.getmaxyx()
         box_height = 6
-        box_width = min(width - 4, 42)
+        box_width = min(width - 4, max(42, min(64, width - 8)))
         top = max(1, (height - box_height) // 2)
         left = max(1, (width - box_width) // 2)
         inner = max(0, box_width - 4)
@@ -721,8 +772,8 @@ def confirm_quit(stdscr, theme: dict) -> bool:
         for row in range(box_height):
             put(stdscr, top + row, left, " " * box_width, box_width, theme["title"])
 
-        put(stdscr, top + 1, left + 2, clip("Close oc-sessions?", inner), inner, theme["header"])
-        put(stdscr, top + 2, left + 2, clip("Unsaved picker state is discarded.", inner), inner, theme["meta"])
+        put(stdscr, top + 1, left + 2, clip(title, inner), inner, theme["header"])
+        put(stdscr, top + 2, left + 2, clip(prompt, inner), inner, theme["meta"])
 
         labels = []
         for row, label in enumerate(options):
@@ -731,8 +782,7 @@ def confirm_quit(stdscr, theme: dict) -> bool:
             else:
                 labels.append(f"  {label} ")
         buttons = "   ".join(labels)
-        start = left + max(2, (box_width - len(buttons)) // 2)
-        x = start
+        x = left + max(2, (box_width - len(buttons)) // 2)
         for row, label in enumerate(options):
             text = labels[row]
             attr = theme["selected_title"] if row == index else theme["title"]
@@ -751,6 +801,46 @@ def confirm_quit(stdscr, theme: dict) -> bool:
             return False
         elif key in (curses.KEY_ENTER, 10, 13):
             return index == 0
+
+
+def drop_session(sessions: list[Session], session_id: str) -> None:
+    sessions[:] = [session for session in sessions if session.id != session_id]
+
+
+def forget_group(groups: dict, session_id: str) -> None:
+    updated = assign_group(groups, session_id, None)
+    groups.clear()
+    groups.update(updated)
+    save_groups(groups)
+
+
+def focus_after_remove(rows: list[Row], around: int) -> int:
+    if not rows:
+        return 0
+    start = min(max(around, 0), len(rows) - 1)
+    found = first_session_index(rows, start, 1)
+    if found is not None:
+        return found
+    found = first_session_index(rows, start, -1)
+    return found if found is not None else 0
+
+
+def drain_keys(stdscr) -> None:
+    stdscr.nodelay(True)
+    try:
+        while stdscr.getch() != curses.ERR:
+            pass
+    finally:
+        stdscr.nodelay(False)
+
+
+def confirm_quit(stdscr, theme: dict) -> bool:
+    return confirm_choice(
+        stdscr,
+        theme,
+        "Close oc-sessions?",
+        "Unsaved picker state is discarded.",
+    )
 
 
 def resume_choice(stdscr, session: Session, theme: dict) -> str | None:
@@ -919,10 +1009,18 @@ def first_session_index(rows: list[Row], start: int = 0, step: int = 1) -> int |
     return None
 
 
+def session_index(rows: list[Row], session_id: str) -> int:
+    return next(
+        (i for i, row in enumerate(rows) if row.session and row.session.id == session_id),
+        first_session_index(rows) or 0,
+    )
+
+
 def picker(
     stdscr,
     sessions: list[Session],
     groups: dict,
+    hidden: set[str],
     palette: dict[str, tuple[int, int, int] | None],
 ) -> tuple[Session, str] | None:
     try:
@@ -930,10 +1028,26 @@ def picker(
     except Exception:
         os.environ.setdefault("ESCDELAY", "25")
     theme = setup_theme(stdscr, palette)
-    rows = build_rows(sessions, groups)
+    viewing_hidden = False
+    shown = [session for session in sessions if session.id not in hidden]
+    rows = build_rows(shown, groups)
     index = first_session_index(rows) or 0
     offset = 0
     status = ""
+
+    def refresh(keep_id: str | None = None, around: int | None = None) -> None:
+        nonlocal shown, rows, index
+        if viewing_hidden:
+            shown = [session for session in sessions if session.id in hidden]
+        else:
+            shown = [session for session in sessions if session.id not in hidden]
+        rows = build_rows(shown, groups)
+        if keep_id:
+            index = session_index(rows, keep_id)
+        elif around is not None:
+            index = focus_after_remove(rows, around)
+        else:
+            index = first_session_index(rows) or 0
 
     while True:
         stdscr.erase()
@@ -943,10 +1057,14 @@ def picker(
         usable = max(1, height - header_rows - footer_rows)
         offset = ensure_visible(rows, index, offset, usable)
 
-        put(stdscr, 0, 0, "OpenCode sessions", width - 12, theme["header"])
-        put(stdscr, 0, max(0, width - 11), f"{len(sessions):>4} total", 11, theme["count"])
+        heading = "Hidden sessions" if viewing_hidden else "OpenCode sessions"
+        put(stdscr, 0, 0, heading, width - 12, theme["header"])
+        put(stdscr, 0, max(0, width - 11), f"{len(shown):>4} total", 11, theme["count"])
 
         y = header_rows
+        if not rows:
+            empty = "No hidden sessions." if viewing_hidden else "No sessions. Press h to view hidden."
+            put(stdscr, header_rows, 0, empty, width, theme["meta"])
         for i, row in enumerate(rows[offset:], start=offset):
             needed = row_height(row)
             if y + needed > height - footer_rows:
@@ -963,12 +1081,18 @@ def picker(
             put(stdscr, y + 1, 1, f" {session.meta}", max(0, width - 1), theme["meta"])
             y += ITEM_HEIGHT
 
-        current = rows[index].session
-        hint = status or "↑↓ move   enter resume   g group   esc quit"
+        current = rows[index].session if rows else None
+        if status:
+            hint = status
+        elif viewing_hidden:
+            hint = "↑↓ move   enter resume   u unhide   r rename   x delete   b back   esc quit"
+        else:
+            hint = "↑↓ move   enter resume   g group   r rename   d hide   h hidden   x delete   esc quit"
         put(stdscr, height - 1, 0, hint, width, theme["hint"])
         stdscr.refresh()
 
         key = stdscr.getch()
+        status = ""
         if key in (ord("q"), 27):
             drain_keys(stdscr)
             if confirm_quit(stdscr, theme):
@@ -996,18 +1120,68 @@ def picker(
                 index = nxt
         elif key == curses.KEY_RESIZE:
             continue
-        elif key == ord("g") and current is not None:
+        elif key == ord("h") and not viewing_hidden:
+            viewing_hidden = True
+            refresh()
+        elif key == ord("b") and viewing_hidden:
+            viewing_hidden = False
+            refresh()
+        elif key == ord("g") and current is not None and not viewing_hidden:
             updated = group_choice(stdscr, current, groups, theme)
             if updated is not None:
                 groups.clear()
                 groups.update(updated)
                 save_groups(groups)
-                session_id = current.id
-                rows = build_rows(sessions, groups)
-                index = next(
-                    (i for i, row in enumerate(rows) if row.session and row.session.id == session_id),
-                    first_session_index(rows) or 0,
-                )
+                refresh(keep_id=current.id)
+        elif key == ord("r") and current is not None:
+            title = prompt_text(stdscr, theme, "Rename session", "Title", current.title)
+            if not title or title == current.title:
+                continue
+            error = rename_session(current.id, title)
+            if error:
+                status = error
+                continue
+            current.title = title
+            status = f"Renamed: {title}"
+        elif key == ord("d") and current is not None and not viewing_hidden:
+            if not confirm_choice(
+                stdscr,
+                theme,
+                current.title,
+                "Hide this session from oc-sessions? OpenCode still keeps it.",
+                yes_label="Hide",
+                no_label="Cancel",
+            ):
+                continue
+            hidden.add(current.id)
+            save_hidden(hidden)
+            refresh(around=index)
+            status = f"Hidden: {current.title}"
+        elif key == ord("u") and current is not None and viewing_hidden:
+            hidden.discard(current.id)
+            save_hidden(hidden)
+            refresh(around=index)
+            status = f"Unhidden: {current.title}"
+        elif key == ord("x") and current is not None:
+            if not confirm_choice(
+                stdscr,
+                theme,
+                current.title,
+                "Permanently delete this OpenCode session?",
+                yes_label="Delete",
+                no_label="Cancel",
+            ):
+                continue
+            error = delete_session(current)
+            if error:
+                status = error
+                continue
+            hidden.discard(current.id)
+            save_hidden(hidden)
+            forget_group(groups, current.id)
+            drop_session(sessions, current.id)
+            refresh(around=index)
+            status = f"Deleted: {current.title}"
         elif key in (curses.KEY_ENTER, 10, 13) and current is not None:
             directory = resume_choice(stdscr, current, theme)
             if not directory:
@@ -1019,14 +1193,17 @@ def picker(
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print("oc-sessions — pick an OpenCode session from any directory")
-        print("Arrow keys / j k to move, enter to resume, g to group, esc to quit.")
+        print("Arrow keys / j k to move, enter to resume, g to group, r to rename.")
+        print("d hides a session from this picker. h views hidden. b goes back. u unhides.")
+        print("x deletes it from OpenCode.")
         print("After enter: resume in the original directory, or resume here.")
         print("In iTerm, resume splits a pane to the right and leaves the picker open.")
         print("If the original directory is gone, it will be created.")
-        print("Groups are local to oc-sessions, not OpenCode pins.")
+        print("Groups and hidden sessions are local to oc-sessions, not OpenCode pins.")
         print("Theme follows OpenCode (/themes or tui.json).")
         return 0
 
+    hidden = load_hidden()
     sessions = load_sessions()
     if not sessions:
         print("No OpenCode sessions found.")
@@ -1034,6 +1211,8 @@ def main() -> int:
 
     if not sys.stdout.isatty():
         for session in sessions:
+            if session.id in hidden:
+                continue
             tag = f" {MISSING_TAG}" if session.missing else ""
             print(f"{session.id}\t{session.title}{tag}\t{session.directory}")
         return 0
@@ -1042,7 +1221,7 @@ def main() -> int:
     mode = active_mode()
     palette = resolved_palette(load_theme_json(name), mode)
     groups = load_groups()
-    curses.wrapper(picker, sessions, groups, palette)
+    curses.wrapper(picker, sessions, groups, hidden, palette)
     return 0
 
 
