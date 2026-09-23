@@ -660,6 +660,7 @@ def draw_title(stdscr, y: int, session: Session, width: int, theme: dict, select
 
 def prompt_text(stdscr, theme: dict, title: str, prompt: str, initial: str = "") -> str | None:
     value = initial
+    cursor = len(value)
     while True:
         height, width = stdscr.getmaxyx()
         box_height = 6
@@ -671,7 +672,16 @@ def prompt_text(stdscr, theme: dict, title: str, prompt: str, initial: str = "")
             put(stdscr, top + row, left, " " * box_width, box_width, theme["title"])
         put(stdscr, top + 1, left + 2, clip(title, inner), inner, theme["header"])
         put(stdscr, top + 2, left + 2, clip(prompt, inner), inner, theme["meta"])
-        field = value + "█"
+        cursor = max(0, min(cursor, len(value)))
+        start = 0
+        if inner > 0 and cursor >= inner:
+            start = cursor - inner + 1
+        visible = value[start : start + max(0, inner)]
+        caret = cursor - start
+        if caret < len(visible):
+            field = visible[:caret] + "█" + visible[caret + 1 :]
+        else:
+            field = visible + "█"
         put(stdscr, top + 4, left + 2, clip(field, inner), inner, theme["selected_title"])
         stdscr.refresh()
         key = stdscr.getch()
@@ -679,13 +689,32 @@ def prompt_text(stdscr, theme: dict, title: str, prompt: str, initial: str = "")
             return None
         if key in (curses.KEY_ENTER, 10, 13):
             return value.strip() or None
+        if key in (curses.KEY_LEFT,):
+            cursor = max(0, cursor - 1)
+            continue
+        if key in (curses.KEY_RIGHT,):
+            cursor = min(len(value), cursor + 1)
+            continue
+        if key == curses.KEY_HOME:
+            cursor = 0
+            continue
+        if key == curses.KEY_END:
+            cursor = len(value)
+            continue
         if key in (curses.KEY_BACKSPACE, 127, 8):
-            value = value[:-1]
+            if cursor > 0:
+                value = value[: cursor - 1] + value[cursor:]
+                cursor -= 1
+            continue
+        if key in (curses.KEY_DC,):
+            if cursor < len(value):
+                value = value[:cursor] + value[cursor + 1 :]
             continue
         if key == curses.KEY_RESIZE:
             continue
         if 32 <= key <= 126:
-            value += chr(key)
+            value = value[:cursor] + chr(key) + value[cursor:]
+            cursor += 1
 
 
 def group_choice(stdscr, session: Session, groups: dict, theme: dict) -> dict | None:
